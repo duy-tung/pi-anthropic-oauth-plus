@@ -247,8 +247,13 @@ export function convertPiMessagesToAnthropic(
 
   const last = params.at(-1);
   if (last?.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
-    const lastBlock = last.content[last.content.length - 1] as { cache_control?: { type: string } };
-    lastBlock.cache_control = { type: "ephemeral" };
+    const lastBlock = last.content[last.content.length - 1] as {
+      cache_control?: { type: string; ttl?: string };
+    };
+    lastBlock.cache_control =
+      process.env.PI_CACHE_RETENTION === "long"
+        ? { type: "ephemeral", ttl: "1h" }
+        : { type: "ephemeral" };
   }
 
   return params;

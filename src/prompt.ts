@@ -43,6 +43,12 @@ export function sanitizeSurrogates(text: string): string {
   );
 }
 
+function cacheControl(): { type: "ephemeral"; ttl?: "1h" } {
+  return process.env.PI_CACHE_RETENTION === "long"
+    ? ({ type: "ephemeral", ttl: "1h" } as any)
+    : { type: "ephemeral" };
+}
+
 export function buildAnthropicSystemPrompt(
   systemPrompt: string | undefined,
   isOAuth: boolean,
@@ -53,7 +59,7 @@ export function buildAnthropicSystemPrompt(
     blocks.push({
       type: "text",
       text: CLAUDE_CODE_IDENTITY,
-      cache_control: { type: "ephemeral" },
+      cache_control: cacheControl(),
     });
   }
 
@@ -62,7 +68,7 @@ export function buildAnthropicSystemPrompt(
     blocks.push({
       type: "text",
       text: sanitized,
-      cache_control: { type: "ephemeral" },
+      cache_control: cacheControl(),
     });
   }
 
