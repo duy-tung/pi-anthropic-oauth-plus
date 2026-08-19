@@ -1,0 +1,49 @@
+{
+  "name": "pi-anthropic-oauth",
+  "version": "0.2.4",
+  "description": "Claude Pro/Max OAuth extension for Pi",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leohenon/pi-anthropic-oauth"
+  },
+  "bugs": {
+    "url": "https://github.com/leohenon/pi-anthropic-oauth/issues"
+  },
+  "homepage": "https://github.com/leohenon/pi-anthropic-oauth#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"require('node:fs').rmSync('.test-dist', { recursive: true, force: true })\" && tsc -p tsconfig.json --outDir .test-dist && node --test test/*.test.mjs",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm test && npm run pack:check"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.8",
+    "@earendil-works/pi-coding-agent": ">=0.80.8"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.8",
+    "@earendil-works/pi-coding-agent": "^0.80.8",
+    "typescript": "^5.9.3"
+  }
+}
