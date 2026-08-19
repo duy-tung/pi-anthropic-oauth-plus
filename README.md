@@ -1,118 +1,57 @@
-# pi-anthropic-oauth
+# pi-anthropic-oauth-plus
 
-[![npm](https://img.shields.io/npm/v/pi-anthropic-oauth?style=flat-square&logo=npm&logoColor=white&label=npm&color=7c3aed)](https://www.npmjs.com/package/pi-anthropic-oauth)
+[pi-anthropic-oauth](https://www.npmjs.com/package/pi-anthropic-oauth) (Claude
+Pro/Max OAuth for [pi](https://github.com/badlogic/pi-mono), MIT, by leohenon)
+plus prompt-cache upgrades. The first commit is the pristine upstream 0.2.4;
+everything on top is this repo's work — see the diff.
 
-Use Claude Pro/Max in Pi with browser OAuth.
+## What's added
 
-> [!IMPORTANT]
-> This extension supports Pi 0.80.8 or later.
+### 1-hour cache TTL (`PI_CACHE_RETENTION=long`)
 
-## Features
+Upstream hardcodes `cache_control: { type: "ephemeral" }` (5-minute TTL), so
+returning to a session after >5 minutes re-bills the whole prompt. With
+`PI_CACHE_RETENTION=long` this fork sends `ttl: "1h"` on every cache
+breakpoint plus the `extended-cache-ttl-2025-04-11` beta. Measured on real
+usage: ~76% of cache misses eliminated (most idle gaps are 5–30 min).
 
-- Claude Pro/Max login from `/login`
-- Automatic token refresh
-- Claude Code-compatible OAuth headers and prompt shaping
-- No Anthropic API key needed
-- Uses the Anthropic models available in Pi's built-in model registry
-- Auto-creates `~/.Claude Code` → `~/.pi` symlink when missing
+### Cache keepalive (replay-and-abort)
 
-## Quick start
+Even 1h dies over lunch. After each successful turn the extension arms a timer
+(default 55 min): it re-sends the byte-identical last request and aborts right
+after `message_start` — the prompt is a pure cache *read* (0.1×), which
+refreshes the TTL for another hour. Guards:
 
-```bash
-pi install npm:pi-anthropic-oauth
-```
+- byte-identical replay only (same tools/system/messages/thinking config);
+- never fires if the cache already expired (would be a pointless 2× re-write);
+- capped at `PI_CACHE_KEEPALIVE` pings (default 3 ≈ keeps cache warm ~4h; `0` disables);
+- prompts under 10k tokens are not worth pinging and are skipped;
+- out-of-band: nothing is emitted to pi, the session file is untouched;
+- `unref()`ed timer, so `pi -p` oneshot runs exit normally.
 
-Start Pi, then run Pi's login command:
+Extra knobs: `PI_CACHE_KEEPALIVE_DELAY_MS`, `PI_CACHE_KEEPALIVE_DEBUG=1`
+(logs to `/tmp/pi-cache-keepalive.log`).
 
-```text
-/login
-```
+### `cacheWrite1h` usage accounting
 
-Choose:
+Parses `cache_creation.ephemeral_1h_input_tokens` into `usage.cacheWrite1h`,
+so you can verify from the session file that 1h writes actually happen.
 
-```text
-Claude Pro/Max
-```
-
-Complete the browser login. After login, select an Anthropic model in Pi.
-
-When the extension is active, `/login` includes `Claude Pro/Max` and Anthropic models show `(sub)` after OAuth login.
-
-Update with:
-
-```bash
-pi update npm:pi-anthropic-oauth
-```
-
-> [!NOTE]
-> Anthropic auth changes are closely monitored for quick compatibility updates.
-
-## System prompt rewriting
-
-When using Claude Pro/Max OAuth, the extension prepends Claude Code identity text and rewrites standalone `Pi` / `pi` references in Pi's system prompt to `Claude Code`. The rewrite mode defaults to `aggressive`:
+## Install
 
 ```bash
-PI_ANTHROPIC_OAUTH_REWRITE_MODE=aggressive
+pi remove npm:pi-anthropic-oauth        # if the upstream package is installed
+pi install git:github.com/duy-tung/pi-anthropic-oauth-plus
+export PI_CACHE_RETENTION=long          # e.g. in ~/.zshenv
 ```
 
-Other modes are opt-in and avoid rewriting some technical strings such as paths, package names, or repository names. If OAuth starts failing, switch back to `aggressive`.
+## Cost model
 
-Available modes:
-
-| Mode             | Behavior                                                                                                    |
-| ---------------- | ----------------------------------------------------------------------------------------------------------- |
-| `aggressive`     | Default. Replaces standalone `Pi` / `pi` wherever the word-boundary pattern matches.                        |
-| `path-safe`      | Avoids replacing `Pi` / `pi` immediately after `/` or `\`, preserving path segments like `/srv/dev/pi-foo`. |
-| `technical-safe` | Avoids replacing `Pi` / `pi` next to common technical-token separators: `/`, `\`, `.`, `@`, `:`, `_`, `-`.  |
-| `custom`         | Uses `PI_ANTHROPIC_OAUTH_REWRITE_PATTERN` as the replacement regex.                                         |
-
-Custom patterns can be a regex source or a JavaScript-style regex literal. The `g` flag is added automatically when omitted:
-
-```bash
-PI_ANTHROPIC_OAUTH_REWRITE_MODE=custom
-PI_ANTHROPIC_OAUTH_REWRITE_PATTERN='(?<![/\\])\b[Pp]i\b'
-# or
-PI_ANTHROPIC_OAUTH_REWRITE_PATTERN='/\bpi\b/gi'
-```
-
-There is no separate off mode. If you need to disable rewriting entirely, use a custom pattern that never matches, such as `(?!)`. Disabling or weakening the rewrite may affect OAuth compatibility.
-
-## Extra models
-
-To add another Anthropic model, create `~/.pi/agent/models.json`:
-
-```json
-{
-  "providers": {
-    "anthropic": {
-      "baseUrl": "https://api.anthropic.com",
-      "apiKey": "unused",
-      "api": "anthropic-messages",
-      "models": [
-        {
-          "id": "your-model-id",
-          "name": "Your Model Name"
-        }
-      ]
-    }
-  }
-}
-```
-
-> [!NOTE]
-> Opus 5 and Fable 5 are included in Pi's built-in Anthropic model catalog as `claude-opus-5` and `claude-fable-5`.
->
-> Pi requires `baseUrl`, `apiKey`, and `api` when defining custom models in `models.json`. With this extension, requests normally authenticate through Claude Pro/Max OAuth after `/login`, so `apiKey` is only a placeholder to satisfy Pi's config requirements and does not need to be a valid Anthropic API key.
->
-> Do not use a fake `sk-ant-oat...` value as the placeholder. If OAuth login has not completed, Pi may try to use that fake token and Anthropic will return `401 Invalid bearer token`. Use a harmless placeholder such as `"unused"`, then run `/login` and choose `Claude Pro/Max`.
-
-## Troubleshooting
-
-- Run `/login` with no arguments, then choose `Claude Pro/Max`.
-- If local callback login does not complete, paste the final callback URL or `code#state` when prompted
-- If you see `401 Invalid bearer token`, remove any fake `sk-ant-oat...` placeholder from `~/.pi/agent/models.json` and log in again
-- If something breaks, please open an issue with your Pi version, extension version, and error output
+- 1h cache writes cost 2× base input (vs 1.25× for 5m); reads stay 0.1×.
+- Worth it when you regularly return to a session after 5–60 min idle.
+- Each keepalive ping costs one cache read of the prompt (0.1×) — profitable
+  whenever the chance you return within the hour exceeds ~5–10%.
 
 ## License
 
-MIT
+MIT — upstream copyright leohenon, modifications copyright duy-tung.

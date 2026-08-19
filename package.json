@@ -1,7 +1,7 @@
 {
-  "name": "pi-anthropic-oauth",
-  "version": "0.2.4",
-  "description": "Claude Pro/Max OAuth extension for Pi",
+  "name": "pi-anthropic-oauth-plus",
+  "version": "0.3.0",
+  "description": "Claude Pro/Max OAuth extension for Pi with prompt-cache upgrades: 1h TTL, keepalive pings, cacheWrite1h accounting",
   "type": "module",
   "license": "MIT",
   "files": [
@@ -14,12 +14,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/leohenon/pi-anthropic-oauth"
+    "url": "https://github.com/duy-tung/pi-anthropic-oauth-plus"
   },
-  "bugs": {
-    "url": "https://github.com/leohenon/pi-anthropic-oauth/issues"
-  },
-  "homepage": "https://github.com/leohenon/pi-anthropic-oauth#readme",
   "publishConfig": {
     "access": "public"
   },
