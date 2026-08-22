@@ -1,4 +1,4 @@
-import { existsSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,20 +7,34 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { loginAnthropic, refreshAnthropicToken } from "./auth.js";
-import { streamAnthropicOAuth } from "./stream.js";
+import { cancelCacheKeepalive, streamAnthropicOAuth } from "./stream.js";
 
-function ensureClaudeCodeSymlink() {
-  const target = join(homedir(), ".pi");
-  const link = join(homedir(), ".Claude Code");
-  if (existsSync(target) && !existsSync(link)) {
-    try {
-      symlinkSync(target, link);
-    } catch { }
+export function ensureClaudeCodeAgentAlias(home: string = homedir()): void {
+  // Aggressive OAuth prompt rewriting can turn `~/.pi/agent` into
+  // `~/.Claude Code/agent`. Preserve that path without aliasing the whole
+  // `~/.pi` state tree on new installations.
+  const target = join(home, ".pi", "agent");
+  const aliasRoot = join(home, ".Claude Code");
+  const alias = join(aliasRoot, "agent");
+  if (!existsSync(target) || existsSync(alias)) return;
+  try {
+    if (!existsSync(aliasRoot)) mkdirSync(aliasRoot, { mode: 0o700 });
+    if (!lstatSync(aliasRoot).isDirectory()) return;
+    symlinkSync(target, alias);
+  } catch {
+    // Compatibility setup is best-effort and must not block provider loading.
   }
 }
 
+export function registerCacheShutdown(
+  pi: ExtensionAPI,
+  cancel: () => void = cancelCacheKeepalive,
+): void {
+  pi.on("session_shutdown", () => cancel());
+}
+
 export default function (pi: ExtensionAPI) {
-  ensureClaudeCodeSymlink();
+  ensureClaudeCodeAgentAlias();
 
   pi.registerProvider("anthropic", {
     baseUrl: "https://api.anthropic.com",
@@ -34,4 +48,6 @@ export default function (pi: ExtensionAPI) {
     } as unknown as ProviderConfig["oauth"],
     streamSimple: streamAnthropicOAuth,
   });
+
+  registerCacheShutdown(pi);
 }

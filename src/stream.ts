@@ -1,4 +1,14 @@
-import { appendFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  writeSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages.js";
 import {
@@ -20,6 +30,11 @@ import {
   type IndexedBlock,
 } from "./convert.js";
 import { buildAnthropicSystemPrompt } from "./prompt.js";
+import {
+  CacheKeepaliveManager,
+  type KeepalivePingResult,
+  resolveKeepalivePolicy,
+} from "./cache-keepalive.js";
 
 const REQUIRED_BETAS = [
   "claude-code-20250219",
@@ -34,135 +49,82 @@ const REQUIRED_BETAS = [
 ] as const;
 
 // ---------------------------------------------------------------------------
-// Cache keepalive: with PI_CACHE_RETENTION=long (1h TTL), an idle session's
-// prompt cache dies after 1h. Re-sending the byte-identical last request and
-// aborting right after `message_start` refreshes the TTL for the price of a
-// cache read (0.1x) instead of a full 2x re-write on the next real request.
-//
-// Guards:
-// - only replays the exact params of the last successful request (same tools,
-//   system, messages, thinking config) so the cache lookup hits;
-// - never runs if the cache is already expired (sleep/wake, timer drift) —
-//   that would be a pointless 2x re-write;
-// - capped at PI_CACHE_KEEPALIVE pings (default 3, 0 disables);
-// - out-of-band: nothing is emitted to pi, the session file is untouched;
-// - timer is unref()ed so oneshot `pi -p` processes exit normally.
+// Cache keepalive: with PI_CACHE_RETENTION=long (1h TTL), replay the exact last
+// successful request at 55-minute intervals and stop after `message_start`.
+// The manager anchors TTL accounting to request start, serializes generations,
+// aborts stale/in-flight pings, and only rearms after a confirmed cache read.
 // ---------------------------------------------------------------------------
 
-const KEEPALIVE_CACHE_TTL_MS = 60 * 60 * 1000;
-const KEEPALIVE_MIN_PROMPT_TOKENS = 10_000;
-
-type KeepaliveState = {
-  timer?: NodeJS.Timeout;
-  count: number;
-  maxPings: number;
-  lastAccessAt: number;
+type AnthropicKeepalivePayload = {
   client: Anthropic;
   params: MessageCreateParamsStreaming;
 };
 
-let keepalive: KeepaliveState | undefined;
+const KEEPALIVE_DEBUG_MAX_BYTES = 64 * 1024;
 
-function keepaliveMaxPings(): number {
-  const raw = process.env.PI_CACHE_KEEPALIVE;
-  if (raw === undefined || raw.trim() === "") return 3;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
-}
-
-function keepaliveDelayMs(): number {
-  const raw = process.env.PI_CACHE_KEEPALIVE_DELAY_MS;
-  const n = raw ? Number(raw) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : 55 * 60 * 1000;
-}
-
-function keepaliveDebug(message: string): void {
-  if (!process.env.PI_CACHE_KEEPALIVE_DEBUG) return;
+export function keepaliveDebug(message: string): void {
+  if (process.env.PI_CACHE_KEEPALIVE_DEBUG !== "1") return;
+  let fd: number | undefined;
   try {
-    appendFileSync(
-      "/tmp/pi-cache-keepalive.log",
-      `${new Date().toISOString()} ${message}\n`,
+    const configDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    const cacheDir = join(configDir, "cache");
+    mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+    const file = join(cacheDir, "cache-keepalive.log");
+    fd = openSync(
+      file,
+      fsConstants.O_WRONLY |
+        fsConstants.O_APPEND |
+        fsConstants.O_CREAT |
+        fsConstants.O_NOFOLLOW,
+      0o600,
     );
-  } catch {}
-}
-
-function cancelKeepalive(): void {
-  if (keepalive?.timer) clearTimeout(keepalive.timer);
-  keepalive = undefined;
-}
-
-function scheduleKeepalive(
-  client: Anthropic,
-  params: MessageCreateParamsStreaming,
-  promptTokens: number,
-): void {
-  cancelKeepalive();
-  if (process.env.PI_CACHE_RETENTION !== "long") return;
-  const maxPings = keepaliveMaxPings();
-  if (maxPings === 0) return;
-  // Tiny prompts are below the model's min cacheable length or simply not
-  // worth refreshing.
-  if (promptTokens < KEEPALIVE_MIN_PROMPT_TOKENS) return;
-  keepalive = {
-    count: 0,
-    maxPings,
-    lastAccessAt: Date.now(),
-    client,
-    params,
-  };
-  armKeepaliveTimer();
-  keepaliveDebug(`scheduled promptTokens=${promptTokens} maxPings=${maxPings}`);
-}
-
-function armKeepaliveTimer(): void {
-  if (!keepalive) return;
-  const timer = setTimeout(() => {
-    void runKeepalivePing();
-  }, keepaliveDelayMs());
-  timer.unref?.();
-  keepalive.timer = timer;
-}
-
-async function runKeepalivePing(): Promise<void> {
-  const state = keepalive;
-  if (!state) return;
-  // Cache already expired: a ping now would be a full 2x cache re-write for a
-  // session nobody may come back to. Give up instead.
-  if (Date.now() - state.lastAccessAt >= KEEPALIVE_CACHE_TTL_MS) {
-    keepaliveDebug("skip: cache TTL already expired");
-    cancelKeepalive();
-    return;
-  }
-  try {
-    const stream = await state.client.messages.create(state.params, {});
-    for await (const event of stream) {
-      if (event.type === "message_start") {
-        const usage = (event as { message?: { usage?: Record<string, unknown> } })
-          .message?.usage as
-          | { cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
-          | undefined;
-        keepaliveDebug(
-          `ping ok cacheRead=${usage?.cache_read_input_tokens ?? 0} cacheWrite=${usage?.cache_creation_input_tokens ?? 0}`,
-        );
-        break; // Prompt processed, cache refreshed; stop paying for output.
-      }
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return;
+    fchmodSync(fd, 0o600);
+    const clean = message.replace(/[\r\n]+/g, " ").slice(0, 512);
+    const line = `${new Date().toISOString()} ${clean}\n`;
+    if (stat.size + Buffer.byteLength(line) > KEEPALIVE_DEBUG_MAX_BYTES) return;
+    writeSync(fd, line);
+  } catch {
+    // Debugging must never affect the provider request path.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
     }
-  } catch (error) {
-    // Expired OAuth token, network trouble, API rejection: stop quietly.
-    keepaliveDebug(`ping failed: ${error instanceof Error ? error.message : String(error)}`);
-    cancelKeepalive();
-    return;
   }
-  // A real request may have superseded this state while the ping was in flight.
-  if (keepalive !== state) return;
-  state.count += 1;
-  state.lastAccessAt = Date.now();
-  if (state.count >= state.maxPings) {
-    keepaliveDebug(`done: reached maxPings=${state.maxPings}`);
-    cancelKeepalive();
-    return;
+}
+
+export async function pingAnthropicCache(
+  payload: AnthropicKeepalivePayload,
+  signal: AbortSignal,
+): Promise<KeepalivePingResult> {
+  const stream = await payload.client.messages.create(payload.params, { signal });
+  for await (const event of stream) {
+    if (event.type !== "message_start") continue;
+    const usage = event.message.usage as unknown as {
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+    return {
+      cacheRead: usage?.cache_read_input_tokens ?? 0,
+      cacheWrite: usage?.cache_creation_input_tokens ?? 0,
+    };
   }
-  armKeepaliveTimer();
+  return { cacheRead: 0, cacheWrite: 0 };
+}
+
+const cacheKeepalive = new CacheKeepaliveManager<AnthropicKeepalivePayload>({
+  now: Date.now,
+  setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimer: (timer) => clearTimeout(timer),
+  ping: pingAnthropicCache,
+  debug: keepaliveDebug,
+});
+
+export function cancelCacheKeepalive(): void {
+  cacheKeepalive.cancel();
 }
 
 function mapStopReason(reason: string | null | undefined): StopReason {
@@ -188,7 +150,13 @@ function headersToRecord(headers: Headers): Record<string, string> {
   return record;
 }
 
-function makeDefaultHeaders(
+export function readCacheWrite1h(usage: unknown): number | undefined {
+  const value = (usage as { cache_creation?: { ephemeral_1h_input_tokens?: unknown } })
+    ?.cache_creation?.ephemeral_1h_input_tokens;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export function makeDefaultHeaders(
   isOAuth: boolean,
   options?: SimpleStreamOptions,
 ): Record<string, string> {
@@ -198,7 +166,7 @@ function makeDefaultHeaders(
   };
 
   if (isOAuth) {
-    const betas = [...REQUIRED_BETAS];
+    const betas: string[] = [...REQUIRED_BETAS];
     if (process.env.PI_CACHE_RETENTION === "long") {
       betas.push("extended-cache-ttl-2025-04-11");
     }
@@ -234,8 +202,9 @@ export function streamAnthropicOAuth(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-  // A new real request supersedes any pending keepalive ping.
-  cancelKeepalive();
+  // A new real request supersedes any pending keepalive ping. Its generation
+  // also prevents an older concurrent completion from publishing stale params.
+  const cacheRequestGeneration = cacheKeepalive.beginRequest();
   const stream = createAssistantMessageEventStream();
 
   void (async () => {
@@ -319,6 +288,7 @@ export function streamAnthropicOAuth(
       // which throws under fine-grained-tool-streaming (input may be invalid
       // mid-flight) and aborts the turn. The raw stream yields the same
       // RawMessageStreamEvents; tool args are already parsed leniently below.
+      const providerRequestStartedAt = Date.now();
       const { data: anthropicStream, response: httpResponse } =
         await client.messages
           .create(params, {
@@ -354,9 +324,7 @@ export function streamAnthropicOAuth(
           output.usage.cacheWrite =
             (event.message.usage as { cache_creation_input_tokens?: number })
               .cache_creation_input_tokens || 0;
-          (output.usage as any).cacheWrite1h =
-            (event.message.usage as any).cache_creation
-              ?.ephemeral_1h_input_tokens || 0;
+          output.usage.cacheWrite1h = readCacheWrite1h(event.message.usage) ?? 0;
           output.usage.totalTokens =
             output.usage.input +
             output.usage.output +
@@ -533,9 +501,8 @@ export function streamAnthropicOAuth(
           output.usage.cacheWrite =
             (event.usage as { cache_creation_input_tokens?: number })
               .cache_creation_input_tokens || 0;
-          const cc1h = (event.usage as any).cache_creation
-            ?.ephemeral_1h_input_tokens;
-          if (cc1h != null) (output.usage as any).cacheWrite1h = cc1h;
+          const cacheWrite1h = readCacheWrite1h(event.usage);
+          if (cacheWrite1h !== undefined) output.usage.cacheWrite1h = cacheWrite1h;
           const thinkingTokens = (
             event.usage as {
               output_tokens_details?: { thinking_tokens?: number };
@@ -560,10 +527,12 @@ export function streamAnthropicOAuth(
         message: output,
       });
       stream.end();
-      scheduleKeepalive(
-        client,
-        params,
+      cacheKeepalive.finishRequest(
+        cacheRequestGeneration,
+        { client, params },
         output.usage.input + output.usage.cacheRead + output.usage.cacheWrite,
+        providerRequestStartedAt,
+        resolveKeepalivePolicy(),
       );
     } catch (error) {
       for (const block of output.content as Array<{
