@@ -7,6 +7,18 @@ everything on top is this repo's work — see the diff.
 
 ## What's added
 
+### Pi 0.84.3 provider compatibility
+
+- honors Pi's `onPayload` replacement hook, so request-body extensions such as
+  `speed: "fast"` reach Anthropic;
+- maps provider-neutral `toolChoice` and declares OAuth as subscription-backed;
+- sends configured server-side fallback models and prices usage against the
+  model Anthropic actually returns;
+- merges caller beta headers with the required OAuth/interleaved/long-cache
+  betas instead of replacing them;
+- always removes fine-grained tool streaming because its raw partial JSON can
+  corrupt large edit arguments.
+
 ### 1-hour cache TTL (`PI_CACHE_RETENTION=long`)
 
 Upstream hardcodes `cache_control: { type: "ephemeral" }` (5-minute TTL), so
@@ -50,9 +62,11 @@ so you can verify from the session file that 1h writes actually happen.
 
 ```bash
 pi remove npm:pi-anthropic-oauth        # if the upstream package is installed
-pi install git:github.com/duy-tung/pi-anthropic-oauth-plus@v0.3.1
+pi install git:github.com/duy-tung/pi-anthropic-oauth-plus@v0.3.2
 export PI_CACHE_RETENTION=long          # e.g. in ~/.zshenv
 ```
+
+Version 0.3.2 requires Pi 0.84.3 or newer.
 
 ### Prompt-rewrite compatibility alias
 

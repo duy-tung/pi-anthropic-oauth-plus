@@ -12,6 +12,7 @@ import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages.js";
 import {
+  type AnthropicAllowedFallbackModel,
   type Api,
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -36,17 +37,24 @@ import {
   resolveKeepalivePolicy,
 } from "./cache-keepalive.js";
 
+const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
+const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const REQUIRED_BETAS = [
   "claude-code-20250219",
   "oauth-2025-04-20",
-  // fine-grained-tool-streaming removed: it ships the model's raw, unvalidated
-  // tool-input JSON. For large edits full of quotes/newlines the streamed
-  // string escaping breaks, so a field (e.g. edit.oldText) swallows the rest of
-  // the structure — surfacing as either a hard JSON.parse crash or a wrong-shape
-  // schema-validation failure. Default streaming has the server validate/buffer
-  // tool JSON, guaranteeing well-formed, correctly-structured input.
   "interleaved-thinking-2025-05-14",
 ] as const;
+
+// Fine-grained tool streaming ships raw, unvalidated tool-input JSON. Large
+// edits containing quotes/newlines can arrive with a field swallowing the rest
+// of the structure. Always keep the server-buffered default, even if another
+// extension asks for the beta while contributing unrelated headers.
+const BLOCKED_BETAS = new Set([FINE_GRAINED_TOOL_STREAMING_BETA]);
+
+export type AnthropicRequestParams = MessageCreateParamsStreaming & {
+  fallbacks?: Array<{ model: string }>;
+  speed?: "fast";
+};
 
 // ---------------------------------------------------------------------------
 // Cache keepalive: with PI_CACHE_RETENTION=long (1h TTL), replay the exact last
@@ -57,7 +65,7 @@ const REQUIRED_BETAS = [
 
 type AnthropicKeepalivePayload = {
   client: Anthropic;
-  params: MessageCreateParamsStreaming;
+  params: AnthropicRequestParams;
 };
 
 const KEEPALIVE_DEBUG_MAX_BYTES = 64 * 1024;
@@ -156,26 +164,87 @@ export function readCacheWrite1h(usage: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+type AnthropicUsageFields = {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  output_tokens_details?: { thinking_tokens?: number | null };
+};
+
+export function applyAnthropicUsage(
+  target: AssistantMessage["usage"],
+  value: unknown,
+): void {
+  const usage = value as AnthropicUsageFields;
+  if (usage.input_tokens != null) target.input = usage.input_tokens;
+  if (usage.output_tokens != null) target.output = usage.output_tokens;
+  if (usage.cache_read_input_tokens != null) {
+    target.cacheRead = usage.cache_read_input_tokens;
+  }
+  if (usage.cache_creation_input_tokens != null) {
+    target.cacheWrite = usage.cache_creation_input_tokens;
+  }
+  const cacheWrite1h = readCacheWrite1h(value);
+  if (cacheWrite1h !== undefined) target.cacheWrite1h = cacheWrite1h;
+  const thinkingTokens = usage.output_tokens_details?.thinking_tokens;
+  if (thinkingTokens != null) target.reasoning = thinkingTokens;
+  target.totalTokens =
+    target.input + target.output + target.cacheRead + target.cacheWrite;
+}
+
+export function getAllowedFallbackModels(
+  model: Model<Api>,
+): AnthropicAllowedFallbackModel[] {
+  return (
+    model.compat as
+      | { allowedFallbackModels?: AnthropicAllowedFallbackModel[] }
+      | undefined
+  )?.allowedFallbackModels ?? [];
+}
+
+export function resolveUsageModel(
+  model: Model<Api>,
+  responseModel: string,
+): Model<Api> {
+  if (responseModel === model.id) return model;
+  const fallback = getAllowedFallbackModels(model).find(
+    (candidate) =>
+      candidate.provider === model.provider && candidate.model === responseModel,
+  );
+  return fallback
+    ? { ...model, id: responseModel, cost: fallback.cost }
+    : model;
+}
+
+function betaValues(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((beta) => beta.trim())
+    .filter((beta) => beta && !BLOCKED_BETAS.has(beta));
+}
+
 export function makeDefaultHeaders(
   isOAuth: boolean,
   options?: SimpleStreamOptions,
+  serverSideFallback = false,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     accept: "application/json",
     "anthropic-dangerous-direct-browser-access": "true",
   };
+  const betas = new Set<string>(
+    isOAuth ? REQUIRED_BETAS : ["interleaved-thinking-2025-05-14"],
+  );
 
   if (isOAuth) {
-    const betas: string[] = [...REQUIRED_BETAS];
     if (process.env.PI_CACHE_RETENTION === "long") {
-      betas.push("extended-cache-ttl-2025-04-11");
+      betas.add("extended-cache-ttl-2025-04-11");
     }
-    headers["anthropic-beta"] = betas.join(",");
     headers["user-agent"] = USER_AGENT;
     headers["x-app"] = "cli";
-  } else {
-    headers["anthropic-beta"] = ["interleaved-thinking-2025-05-14"].join(",");
   }
+  if (serverSideFallback) betas.add(SERVER_SIDE_FALLBACK_BETA);
 
   if (options?.headers) {
     for (const [key, value] of Object.entries(options.headers)) {
@@ -186,6 +255,12 @@ export function makeDefaultHeaders(
       ) {
         continue;
       }
+      if (normalizedKey === "anthropic-beta") {
+        if (typeof value === "string") {
+          for (const beta of betaValues(value)) betas.add(beta);
+        }
+        continue;
+      }
       const existingKey = Object.keys(headers).find(
         (header) => header.toLowerCase() === normalizedKey,
       );
@@ -194,7 +269,66 @@ export function makeDefaultHeaders(
     }
   }
 
+  headers["anthropic-beta"] = [...betas]
+    .filter((beta) => !BLOCKED_BETAS.has(beta))
+    .join(",");
   return headers;
+}
+
+export async function prepareAnthropicRequest(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  isOAuth: boolean,
+): Promise<AnthropicRequestParams> {
+  const maxTokens = options?.maxTokens || Math.floor(model.maxTokens / 3);
+  let params: AnthropicRequestParams = {
+    model: model.id,
+    messages: convertPiMessagesToAnthropic(context.messages, isOAuth, model),
+    max_tokens: maxTokens,
+    stream: true,
+  };
+
+  const system = buildAnthropicSystemPrompt(context.systemPrompt, isOAuth);
+  if (system) params.system = system as never;
+  if (context.tools?.length) {
+    params.tools = convertPiToolsToAnthropic(context.tools, isOAuth);
+  }
+
+  if (options?.reasoning && model.reasoning && maxTokens > 1) {
+    const defaultBudgets: Record<string, number> = {
+      minimal: 1024,
+      low: 4096,
+      medium: 10240,
+      high: 20480,
+      xhigh: 32000,
+    };
+    const customBudget =
+      options.thinkingBudgets?.[
+        options.reasoning as keyof typeof options.thinkingBudgets
+      ];
+    const requestedBudget =
+      customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
+
+    params.thinking = {
+      type: "enabled",
+      budget_tokens: Math.min(requestedBudget, maxTokens - 1),
+    };
+  }
+
+  if (options?.toolChoice) {
+    params.tool_choice = { type: options.toolChoice };
+  }
+  const fallbacks = getAllowedFallbackModels(model);
+  if (fallbacks.length > 0) {
+    params.fallbacks = fallbacks.map((fallback) => ({ model: fallback.model }));
+  }
+
+  const replacement = await options?.onPayload?.(params, model);
+  if (replacement !== undefined) {
+    params = replacement as AnthropicRequestParams;
+  }
+  return params;
 }
 
 export function streamAnthropicOAuth(
@@ -235,7 +369,12 @@ export function streamAnthropicOAuth(
       }
 
       const isOAuth = isClaudeOAuthAccessToken(apiKey);
-      const defaultHeaders = makeDefaultHeaders(isOAuth, options);
+      const allowedFallbackModels = getAllowedFallbackModels(model);
+      const defaultHeaders = makeDefaultHeaders(
+        isOAuth,
+        options,
+        allowedFallbackModels.length > 0,
+      );
 
       if (isOAuth) defaultHeaders.authorization = `Bearer ${apiKey}`;
 
@@ -245,43 +384,16 @@ export function streamAnthropicOAuth(
         authToken: isOAuth ? apiKey : null,
         defaultHeaders,
         dangerouslyAllowBrowser: true,
+        fetch: options?.fetch,
       });
 
-      const maxTokens =
-        options?.maxTokens || Math.floor(model.maxTokens / 3);
-
-      const params: MessageCreateParamsStreaming = {
-        model: model.id,
-        messages: convertPiMessagesToAnthropic(context.messages, isOAuth, model),
-        max_tokens: maxTokens,
-        stream: true,
-      };
-
-      const system = buildAnthropicSystemPrompt(context.systemPrompt, isOAuth);
-      if (system) params.system = system as never;
-      if (context.tools?.length)
-        params.tools = convertPiToolsToAnthropic(context.tools, isOAuth);
-
-      if (options?.reasoning && model.reasoning && maxTokens > 1) {
-        const defaultBudgets: Record<string, number> = {
-          minimal: 1024,
-          low: 4096,
-          medium: 10240,
-          high: 20480,
-          xhigh: 32000,
-        };
-        const customBudget =
-          options.thinkingBudgets?.[
-            options.reasoning as keyof typeof options.thinkingBudgets
-          ];
-        const requestedBudget =
-          customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
-
-        params.thinking = {
-          type: "enabled",
-          budget_tokens: Math.min(requestedBudget, maxTokens - 1),
-        };
-      }
+      const params = await prepareAnthropicRequest(
+        model,
+        context,
+        options,
+        isOAuth,
+      );
+      let usageModel = model;
 
       // Raw stream instead of the MessageStream helper: MessageStream
       // accumulates tool_use input and JSON.parses it on content_block_stop,
@@ -316,21 +428,11 @@ export function streamAnthropicOAuth(
 
       for await (const event of anthropicStream) {
         if (event.type === "message_start") {
-          output.usage.input = event.message.usage.input_tokens || 0;
-          output.usage.output = event.message.usage.output_tokens || 0;
-          output.usage.cacheRead =
-            (event.message.usage as { cache_read_input_tokens?: number })
-              .cache_read_input_tokens || 0;
-          output.usage.cacheWrite =
-            (event.message.usage as { cache_creation_input_tokens?: number })
-              .cache_creation_input_tokens || 0;
-          output.usage.cacheWrite1h = readCacheWrite1h(event.message.usage) ?? 0;
-          output.usage.totalTokens =
-            output.usage.input +
-            output.usage.output +
-            output.usage.cacheRead +
-            output.usage.cacheWrite;
-          calculateCost(model, output.usage);
+          output.responseId = event.message.id;
+          output.model = event.message.model;
+          usageModel = resolveUsageModel(model, output.model);
+          applyAnthropicUsage(output.usage, event.message.usage);
+          calculateCost(usageModel, output.usage);
           continue;
         }
 
@@ -489,34 +591,8 @@ export function streamAnthropicOAuth(
 
         if (event.type === "message_delta") {
           output.stopReason = mapStopReason(event.delta.stop_reason);
-          output.usage.input =
-            (event.usage as { input_tokens?: number }).input_tokens ||
-            output.usage.input;
-          output.usage.output =
-            (event.usage as { output_tokens?: number }).output_tokens ||
-            output.usage.output;
-          output.usage.cacheRead =
-            (event.usage as { cache_read_input_tokens?: number })
-              .cache_read_input_tokens || 0;
-          output.usage.cacheWrite =
-            (event.usage as { cache_creation_input_tokens?: number })
-              .cache_creation_input_tokens || 0;
-          const cacheWrite1h = readCacheWrite1h(event.usage);
-          if (cacheWrite1h !== undefined) output.usage.cacheWrite1h = cacheWrite1h;
-          const thinkingTokens = (
-            event.usage as {
-              output_tokens_details?: { thinking_tokens?: number };
-            }
-          ).output_tokens_details?.thinking_tokens;
-          if (thinkingTokens != null) {
-            output.usage.reasoning = thinkingTokens;
-          }
-          output.usage.totalTokens =
-            output.usage.input +
-            output.usage.output +
-            output.usage.cacheRead +
-            output.usage.cacheWrite;
-          calculateCost(model, output.usage);
+          applyAnthropicUsage(output.usage, event.usage);
+          calculateCost(usageModel, output.usage);
         }
       }
 

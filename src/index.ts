@@ -1,10 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
-  type ExtensionAPI,
-  type ProviderConfig,
-} from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { loginAnthropic, refreshAnthropicToken } from "./auth.js";
 import { cancelCacheKeepalive, streamAnthropicOAuth } from "./stream.js";
@@ -33,21 +30,25 @@ export function registerCacheShutdown(
   pi.on("session_shutdown", () => cancel());
 }
 
-export default function (pi: ExtensionAPI) {
-  ensureClaudeCodeAgentAlias();
-
+export function registerAnthropicProvider(pi: ExtensionAPI): void {
   pi.registerProvider("anthropic", {
     baseUrl: "https://api.anthropic.com",
     api: "anthropic-messages",
     oauth: {
       name: "Claude Pro/Max",
+      isSubscription: true,
       usesCallbackServer: true,
       login: loginAnthropic,
       refreshToken: refreshAnthropicToken,
       getApiKey: (credentials: OAuthCredentials) => credentials.access,
-    } as unknown as ProviderConfig["oauth"],
+    },
     streamSimple: streamAnthropicOAuth,
   });
 
   registerCacheShutdown(pi);
+}
+
+export default function (pi: ExtensionAPI) {
+  ensureClaudeCodeAgentAlias();
+  registerAnthropicProvider(pi);
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-anthropic-oauth-plus",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Claude Pro/Max OAuth extension for Pi with prompt-cache upgrades: 1h TTL, keepalive pings, cacheWrite1h accounting",
   "type": "module",
   "license": "MIT",
@@ -34,12 +34,12 @@
     "@anthropic-ai/sdk": "^0.52.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.8",
-    "@earendil-works/pi-coding-agent": ">=0.80.8"
+    "@earendil-works/pi-ai": ">=0.84.3",
+    "@earendil-works/pi-coding-agent": ">=0.84.3"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "@types/node": "^24.12.0",
     "typescript": "^5.9.3"
   }
